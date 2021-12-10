@@ -186,7 +186,12 @@ public final class Logger: NSObject {
     
     public func forceSend(_ completionHandler: @escaping (_ error: Error?) -> Void = {_ in }) {
         if enableLogstashLogging {
-            logstash?.forceSend(completionHandler)
+            do {
+                try logstash?.forceSend()
+                completionHandler(nil)
+            } catch {
+                completionHandler(error)
+            }
         }
     }
     

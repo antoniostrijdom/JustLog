@@ -10,7 +10,7 @@ import Foundation
 
 public protocol LogstashDestinationSocketProtocol {
     
-    typealias LogstashDestinationSocketProtocolCompletion = ([Int: Error]) -> Void
+    typealias LogstashDestinationSocketProtocolSendResult = [Int: Error]
     typealias LogstashDestinationSocketProtocolTransform = ([String: Any]) -> Data
     
     init(host: String, port: UInt16, timeout: TimeInterval, logActivity: Bool, allowUntrustedServer: Bool)
@@ -18,9 +18,7 @@ public protocol LogstashDestinationSocketProtocol {
     func cancel()
     
     func sendLogs(_ logs: [Int: [String: Any]],
-                  transform: @escaping LogstashDestinationSocketProtocolTransform,
-                  queue: DispatchQueue,
-                  complete: @escaping LogstashDestinationSocketProtocolCompletion)
+                  transform: @escaping LogstashDestinationSocketProtocolTransform) async -> LogstashDestinationSocketProtocolSendResult
 }
 
 class LogstashDestinationSocket: NSObject, LogstashDestinationSocketProtocol {
@@ -68,50 +66,29 @@ class LogstashDestinationSocket: NSObject, LogstashDestinationSocketProtocol {
     
     /// Create (and resume) stream tasks to send the logs provided to the server
     func sendLogs(_ logs: [Int: [String: Any]],
-                  transform: @escaping LogstashDestinationSocketProtocolTransform,
-                  queue: DispatchQueue,
-                  complete: @escaping LogstashDestinationSocketProtocolCompletion) {
-        dispatchQueue.async { [weak self] in
-            guard let self = self else {
-                complete([:])
-                return
-            }
-            
-            let task = self.session.streamTask(withHostName: self.host, port: self.port)
-            if !self.allowUntrustedServer {
-                task.startSecureConnection()
-            }
-            let dispatchGroup = DispatchGroup()
-            var sendStatus = [Int: Error]()
-            for log in logs.sorted(by: { $0.0 < $1.0 }) {
-                let tag = log.0
-                let logData = transform(log.1)
-                dispatchGroup.enter()
-                task.write(logData, timeout: self.timeout) { [weak self] error in
-                    guard let self = self else {
-                        dispatchGroup.leave()
-                        return
-                    }
-
-                    self.dispatchQueue.async {
-                        if let error = error {
-                            sendStatus[tag] = error
-                        }
-
-                        dispatchGroup.leave()
-                    }
-                }
-            }
-            task.resume()
-            
-            dispatchGroup.notify(queue: queue) {
-                complete(sendStatus)
+                  transform: @escaping LogstashDestinationSocketProtocolTransform) async -> LogstashDestinationSocketProtocolSendResult {
+          
+        let streamTask = self.session.streamTask(withHostName: self.host, port: self.port)
+        streamTask.resume()
+        if !self.allowUntrustedServer {
+            streamTask.startSecureConnection()
+        }
+        var sendStatus = LogstashDestinationSocketProtocolSendResult()
+        for log in logs.sorted(by: { $0.0 < $1.0 }) {
+            let tag = log.0
+            let logData = transform(log.1)
+            do {
+                try await streamTask.write(logData, timeout: self.timeout)
+            } catch {
+                sendStatus[tag] = error
             }
         }
+        
+        return sendStatus
     }
 }
 
-private class LogstashDestinationURLSessionDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, URLSessionStreamDelegate {
+private class LogstashDestinationURLSessionDelegate: NSObject, URLSessionTaskDelegate {
     private let host: String
     private let logActivity: Bool
     

@@ -18,33 +18,28 @@ class LogstashDestinationWriter {
         self.shouldLogActivity = shouldLogActivity
     }
     
-    func write(logs: [LogTag: LogContent],
-               queue: DispatchQueue,
-               completionHandler: @escaping ([LogTag: LogContent]?, Error?) -> Void) {
+    func write(logs: [LogTag: LogContent]) async -> ([LogTag: LogContent]?, Error?) {
         
         guard !logs.isEmpty else {
             Self.printActivity("writeLogs() - nothing to write", shouldLogActivity: self.shouldLogActivity)
-            completionHandler(nil, nil)
-            return
+            return (nil, nil)
         }
 
         let shouldLogActivity = self.shouldLogActivity
-        socket.sendLogs(logs, transform: transformLogToData, queue: queue) { status in
-            let unsentLog = logs.filter { status.keys.contains($0.key) }
-            if unsentLog.isEmpty {
-                Self.printActivity("🔌 <LogstashDestination>, did write tags: \(logs.keys)", shouldLogActivity: shouldLogActivity)
-                completionHandler(nil, nil)
-                return
-            }
-            
-            if shouldLogActivity {
-                status.forEach {
-                    Self.printActivity("🔌 <LogstashDestination>, \($0.key) did error: \($0.value.localizedDescription)", shouldLogActivity: shouldLogActivity)
-                }
-            }
-            
-            completionHandler(unsentLog, status.first?.value)
+        let status = await socket.sendLogs(logs, transform: transformLogToData)
+        let unsentLog = logs.filter { status.keys.contains($0.key) }
+        if unsentLog.isEmpty {
+            Self.printActivity("🔌 <LogstashDestination>, did write tags: \(logs.keys)", shouldLogActivity: shouldLogActivity)
+            return (nil, nil)
         }
+        
+        if shouldLogActivity {
+            status.forEach {
+                Self.printActivity("🔌 <LogstashDestination>, \($0.key) did error: \($0.value.localizedDescription)", shouldLogActivity: shouldLogActivity)
+            }
+        }
+            
+        return (unsentLog, status.first?.value)
     }
     
     private func transformLogToData(_ dict: LogContent) -> Data {

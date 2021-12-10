@@ -12,30 +12,62 @@ import SwiftyBeaver
 typealias LogContent = [String: Any]
 typealias LogTag = Int
 
-/// This entire class relies on `operationQueue` to synchronise access to the `logsToShip` dictionary
-/// Every action is put in the `operationQueue` which is synchronous, even though the actual sending
-/// via `URLSession` is not. The writers' completion handler are executed on the underlying queue of the `OperationQueue`
-/// Here's a brief summary of what operations are added to the queue and when:
-/// A log is generated via `send` and added to the `logsToShip` dictionary (along with a `tag` identifier).
-/// At some point `writeLogs` is called that creates an `NSURLSessionStreamTask` to send the log to the server.
-/// Once the writer has completed all operations, it calls the completion handler passing the logs that failed to push.
-/// Those logs are added back to `logsToShip`
-/// An optional `completionHandler` is called when all logs existing before the `forceSend` call have been tried to send once.
+private actor LogQueueManager {
+    private let shouldLogActivity: Bool
+    private let socket: LogstashDestinationSocketProtocol
+    private var logsToShip = [LogTag: LogContent]()
+    
+    init(socket: LogstashDestinationSocketProtocol,
+         shouldLogActivity: Bool) {
+        self.socket = socket
+        self.shouldLogActivity = shouldLogActivity
+    }
+    
+    deinit {
+        self.cancelSending()
+    }
+    
+    private func printActivity(_ string: String) {
+        guard shouldLogActivity else { return }
+        print(string)
+    }
+    
+    func addLog(_ dict: LogContent) {
+        let time = mach_absolute_time()
+        let logTag = Int(truncatingIfNeeded: time)
+        self.logsToShip[logTag] = dict
+    }
+    
+    func send() async throws {
+        let writer = LogstashDestinationWriter(socket: self.socket, shouldLogActivity: shouldLogActivity)
+        let logsBatch = logsToShip
+        logsToShip = [LogTag: LogContent]()
+        let result = await writer.write(logs: logsBatch)
+        if let unsent = result.0 {
+            logsToShip.merge(unsent) { lhs, rhs in lhs }
+            self.printActivity("🔌 <LogstashDestination>, \(unsent.count) failed tasks")
+        }
+        if let error = result.1 {
+            throw error
+        }
+    }
+    
+    func cancelSending() {
+        self.logsToShip = [LogTag: LogContent]()
+        self.socket.cancel()
+    }
+}
+
 public class LogstashDestination: BaseDestination  {
     
     /// Settings
-    var shouldLogActivity: Bool = false
+    var shouldLogActivity: Bool
     public var logzioToken: String?
     
     /// Logs buffer
-    private var logsToShip = [LogTag: LogContent]()
-    private let operationQueue: OperationQueue
-    private let dispatchQueue = DispatchQueue(label: "com.justlog.LogstashDestination.dispatchQueue", qos: .utility)
+    private let logQueue: LogQueueManager
     /// Private
     private let logzioTokenKey = "token"
-    
-    /// Socket
-    private let socket: LogstashDestinationSocketProtocol
     
     @available(*, unavailable)
     override init() {
@@ -43,26 +75,15 @@ public class LogstashDestination: BaseDestination  {
     }
     
     public required init(socket: LogstashDestinationSocketProtocol, logActivity: Bool) {
-        self.operationQueue = OperationQueue()
-        self.operationQueue.underlyingQueue = dispatchQueue
-        self.operationQueue.maxConcurrentOperationCount = 1
-        self.operationQueue.name = "com.justlog.LogstashDestination.operationQueue"
-        self.socket = socket
-        super.init()
+        self.logQueue = LogQueueManager(socket: socket, shouldLogActivity: logActivity)
         self.shouldLogActivity = logActivity
+        super.init()
     }
     
-    deinit {
-        cancelSending()
-    }
-    
-    public func cancelSending() {
-        self.operationQueue.cancelAllOperations()
-        self.operationQueue.addOperation { [weak self] in
-            guard let self = self else { return }
-            self.logsToShip = [LogTag: LogContent]()
+    func cancelSending() {
+        Task {
+            await logQueue.cancelSending()
         }
-        self.socket.cancel()
     }
     
     // MARK: - Log dispatching
@@ -74,46 +95,22 @@ public class LogstashDestination: BaseDestination  {
                               function: String,
                               line: Int,
                               context: Any? = nil) -> String? {
-        
-        if let dict = msg.toDictionary() {
-            var flattened = dict.flattened()
-            if let logzioToken = logzioToken {
-                flattened = flattened.merged(with: [logzioTokenKey: logzioToken])
+        Task {
+            if let dict = msg.toDictionary() {
+                var flattened = dict.flattened()
+                if let logzioToken = logzioToken {
+                    flattened = flattened.merged(with: [logzioTokenKey: logzioToken])
+                }
+                await logQueue.addLog(flattened)
             }
-            addLog(flattened)
         }
         
         return nil
     }
 
-    private func addLog(_ dict: LogContent) {
-        operationQueue.addOperation { [weak self] in
-            guard let self = self else { return }
-            
-            let time = mach_absolute_time()
-            let logTag = Int(truncatingIfNeeded: time)
-            self.logsToShip[logTag] = dict
-        }
-    }
-
-    public func forceSend(_ completionHandler: @escaping (_ error: Error?) -> Void = {_ in }) {
-        operationQueue.addOperation { [weak self] in
-            guard let self = self else { return }
-            let writer = LogstashDestinationWriter(socket: self.socket, shouldLogActivity: self.shouldLogActivity)
-            let logsBatch = self.logsToShip
-            self.logsToShip = [LogTag: LogContent]()
-            writer.write(logs: logsBatch, queue: self.dispatchQueue) { [weak self] missing, error in
-                guard let self = self else {
-                    completionHandler(error)
-                    return
-                }
-                
-                if let unsent = missing {
-                    self.logsToShip.merge(unsent) { lhs, rhs in lhs }
-                    self.printActivity("🔌 <LogstashDestination>, \(unsent.count) failed tasks")
-                }
-                completionHandler(error)
-            }
+    public func forceSend() throws {
+        Task {
+            try await logQueue.send()
         }
     }
 }
