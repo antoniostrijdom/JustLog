@@ -13,48 +13,20 @@ typealias LogContent = [String: Any]
 typealias LogTag = Int
 
 private actor LogQueueManager {
-    private let shouldLogActivity: Bool
-    private let socket: LogstashDestinationSocketProtocol
-    private var logsToShip = [LogTag: LogContent]()
-    
-    init(socket: LogstashDestinationSocketProtocol,
-         shouldLogActivity: Bool) {
-        self.socket = socket
-        self.shouldLogActivity = shouldLogActivity
-    }
-    
-    deinit {
-        self.cancelSending()
-    }
-    
-    private func printActivity(_ string: String) {
-        guard shouldLogActivity else { return }
-        print(string)
-    }
+    private(set) var logsToShip = [LogTag: LogContent]()
     
     func addLog(_ dict: LogContent) {
         let time = mach_absolute_time()
         let logTag = Int(truncatingIfNeeded: time)
-        self.logsToShip[logTag] = dict
+        logsToShip[logTag] = dict
     }
     
-    func send() async throws {
-        let writer = LogstashDestinationWriter(socket: self.socket, shouldLogActivity: shouldLogActivity)
-        let logsBatch = logsToShip
-        logsToShip = [LogTag: LogContent]()
-        let result = await writer.write(logs: logsBatch)
-        if let unsent = result.0 {
-            logsToShip.merge(unsent) { lhs, rhs in lhs }
-            self.printActivity("🔌 <LogstashDestination>, \(unsent.count) failed tasks")
-        }
-        if let error = result.1 {
-            throw error
-        }
+    func reset() {
+        logsToShip.removeAll()
     }
     
-    func cancelSending() {
-        self.logsToShip = [LogTag: LogContent]()
-        self.socket.cancel()
+    func mergeLogs(_ logsToMerge : [LogTag: LogContent]) {
+        logsToShip.merge(logsToMerge) { lhs, rhs in lhs }
     }
 }
 
@@ -65,7 +37,9 @@ public class LogstashDestination: BaseDestination  {
     public var logzioToken: String?
     
     /// Logs buffer
-    private let logQueue: LogQueueManager
+    private let logQueue = LogQueueManager()
+    /// Socket
+    private let socket: LogstashDestinationSocketProtocol
     /// Private
     private let logzioTokenKey = "token"
     
@@ -75,15 +49,34 @@ public class LogstashDestination: BaseDestination  {
     }
     
     public required init(socket: LogstashDestinationSocketProtocol, logActivity: Bool) {
-        self.logQueue = LogQueueManager(socket: socket, shouldLogActivity: logActivity)
+        self.socket = socket
         self.shouldLogActivity = logActivity
         super.init()
     }
     
+    deinit {
+        cancelSending()
+    }
+    
+    func send() async throws {
+        let writer = LogstashDestinationWriter(socket: self.socket, shouldLogActivity: shouldLogActivity)
+        let logsBatch = await logQueue.logsToShip
+        await logQueue.reset()
+        let result = await writer.write(logs: logsBatch)
+        if let unsent = result.0 {
+            await logQueue.mergeLogs(unsent)
+            self.printActivity("🔌 <LogstashDestination>, \(unsent.count) failed tasks")
+        }
+        if let error = result.1 {
+            throw error
+        }
+    }
+    
     func cancelSending() {
         Task {
-            await logQueue.cancelSending()
+            await logQueue.reset()
         }
+        self.socket.cancel()
     }
     
     // MARK: - Log dispatching
@@ -110,7 +103,7 @@ public class LogstashDestination: BaseDestination  {
 
     public func forceSend() throws {
         Task {
-            try await logQueue.send()
+            try await send()
         }
     }
 }

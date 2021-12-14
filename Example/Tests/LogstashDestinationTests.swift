@@ -110,10 +110,11 @@ class MockLogstashDestinationSocket: NSObject, LogstashDestinationSocketProtocol
             if let error: LogstashDestinationTestError? = self.errorState ? .whoops : nil {
                 sendStatus[tag] = error
             }
-            
+            print("sendLogs - sent")
             self.networkOperationCountExpectation?.fulfill()
         }
         
+        print("sendLogs - \(logs.count) sent")
         self.completionHandlerCalledExpectation?.fulfill()
         return sendStatus
     }
